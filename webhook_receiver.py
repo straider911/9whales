@@ -1,28 +1,31 @@
-import os, hmac, hashlib, logging
-from fastapi import FastAPI, Request, Header, HTTPException
+import os, hmac, hashlib, logging, asyncio
+from fastapi import FastAPI, Request, HTTPException
 from decimal import Decimal
 from aiogram import Bot
-import asyncio
 
 app = FastAPI()
 log = logging.getLogger("uvicorn")
 
-# === Env ===
-MORALIS_SECRET = os.getenv("MORALIS_SECRET", "")
+# === ENV ===
 USD_THRESHOLD = Decimal(os.getenv("USD_THRESHOLD", "100000"))
+MORALIS_SECRET = os.getenv("MORALIS_SECRET", "")  # сюда кладём Moralis API Key (новая модель)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
-def verify_signature(body: bytes, signature: str | None) -> bool:
-    # Если секрет не задан — пропускаем проверку (для первичной отладки)
+def is_authorized(headers) -> bool:
+    # Новая модель Moralis: передаёт глобальный API Key в X-API-Key
     if not MORALIS_SECRET:
+        return True  # на время отладки можно пропустить проверку
+    api_key = headers.get("x-api-key") or headers.get("X-API-Key")
+    if api_key and api_key == MORALIS_SECRET:
         return True
-    if not signature:
-        return False
-    mac = hmac.new(MORALIS_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(mac, signature)
+    # На всякий случай поддержим старый вариант:
+    sig = headers.get("x-signature") or headers.get("X-Signature")
+    if sig and sig == MORALIS_SECRET:
+        return True
+    return False
 
 @app.get("/")
 async def root_ok():
@@ -32,25 +35,32 @@ async def root_ok():
 async def health_ok():
     return {"status": "healthy"}
 
-@app.post("/webhook/moralis")
-async def webhook(request: Request, x_signature: str | None = Header(None)):
-    # 1) Проверка подписи
-    body = await request.body()
-    if not verify_signature(body, x_signature):
-        # Возвращаем 403 (Moralis расценит как не-200). Для первичной отладки лучше оставить MORALIS_SECRET пустым.
-        raise HTTPException(status_code=403, detail="Invalid signature")
+async def send_telegram(text: str):
+    if not (bot and TELEGRAM_CHAT_ID):
+        return
+    try:
+        await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML")
+    except Exception as e:
+        log.error(f"Telegram send failed: {e}")
 
-    # 2) Парсим JSON от Moralis
+@app.post("/webhook/moralis")
+async def webhook(request: Request):
+    # 1) Авторизация по ключу (моментальный отказ, если не прошли)
+    if not is_authorized(request.headers):
+        # Возвращаем 403, НО сначала убедитесь, что MORALIS_SECRET верный.
+        raise HTTPException(status_code=403, detail="Unauthorized (check X-API-Key)")
+
+    # 2) Парсинг тела
     try:
         payload = await request.json()
     except Exception:
-        # Если пришло не-JSON, вернём 200, чтобы Moralis не падал из-за формата
+        # Возвращаем 200, чтобы Moralis счёл доставку успешной (важно для тестов)
         return {"ok": True, "note": "non-json body"}
 
     events = payload.get("events") or [payload]
     alerts = []
     for ev in events:
-        # Moralis часто присылает usdValue (string). Если нет — считаем 0
+        # Moralis пример поля: usdValue (строка). Если нет — считаем 0.
         try:
             usd_value = Decimal(str(ev.get("usdValue", "0")))
         except Exception:
@@ -62,25 +72,26 @@ async def webhook(request: Request, x_signature: str | None = Header(None)):
                 "tx": ev.get("txHash", ""),
                 "from": ev.get("fromAddress", ""),
                 "to": ev.get("toAddress", ""),
-                "usd": float(usd_value)
+                "usd": float(usd_value),
             })
 
-    # 3) Безопасно отправляем сообщения в Telegram (если токен/чат задан)
-    if bot and TELEGRAM_CHAT_ID and alerts:
+    # 3) Возвращаем 200 как можно раньше (НЕ ждём Telegram)
+    #    Отправку в Telegram запускаем в фоне, чтобы не ловить таймауты Moralis.
+    if alerts:
+        msgs = []
         for a in alerts:
-            text = (
-                f"<b>🐋 Whale Alert</b>\n"
-                f"Chain: {a['chain']}\n"
-                f"Tx: <code>{a['tx']}</code>\n"
-                f"From: {a['from']}\n"
-                f"To: {a['to']}\n"
-                f"Value: ${a['usd']:,}"
+            msgs.append(
+                (
+                    f"<b>🐋 Whale Alert</b>\n"
+                    f"Chain: {a['chain']}\n"
+                    f"Tx: <code>{a['tx']}</code>\n"
+                    f"From: {a['from']}\n"
+                    f"To: {a['to']}\n"
+                    f"Value: ${a['usd']:,}"
+                )
             )
-            try:
-                await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML")
-            except Exception as e:
-                # Логируем, но НЕ роняем обработку — вернём 200 Moralis во что бы то ни стало
-                log.error(f"Telegram send failed: {e}")
+        # Огонь в фоне:
+        for t in msgs:
+            asyncio.create_task(send_telegram(t))
 
-    # 4) Всегда возвращаем 200 ОК для Moralis
     return {"ok": True, "alerts": len(alerts)}
